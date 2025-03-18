@@ -1,0 +1,206 @@
+
+### main analyasis ####
+# PARAMETERS FOR THE EXPOSURE-RESPONSE FUNCTION
+varper <- c(50,90)
+varfun = "ns"
+
+# PARAMETERS FOR THE LAG-RESPONSE FUNCTION
+lag <- 10
+lagnk <- 2
+
+# DEGREES OF FREEDOM FOR SEASONALITY
+dfseas <- 4
+
+# DEGREES OF FREEDOM/DECADE FOR TIME TREND
+dftrend <- 1
+
+# MODEL FORMULAE
+formula <- y ~ cb + factor(dow) +holiday+ ns(doy,df=dfseas):factor(year) +
+    ns(date,df=round(length(unique(year))/dftrend/10))
+
+outcome <- c('hosp_all_cause','hosp_cvd_cause','hosp_resp_cause',
+             'ed_all_cause','ed_cvd_cause','ed_resp_cause')
+
+## loading test data ###
+# ARRANGE THE DATA AS A LIST OF DATA SETS
+regions_SA2 <- as.character(unique(hosp_data_SA2$LocIDSmall))
+dlist_SA2 <- lapply(regions_SA2,function(x) hosp_data_SA2[hosp_data_SA2$LocIDSmall==x,])
+names(dlist_SA2) <- regions_SA2
+
+# ARRANGE THE DATA AS A LIST OF DATA SETS
+regions_hosp <- as.character(unique(hosp_data_SA3$LocIDLarge))
+dlist_hosp <- lapply(regions_hosp,function(x) hosp_data_SA3[hosp_data_SA3$LocIDLarge==x,])
+names(dlist_hosp) <- regions_hosp
+
+
+# load population data ###
+sim_pop<-readRDS("POP_statistics.rds")
+pop_SA2<-merge(data.frame(LocIDSmall=unique(hosp_data$LocIDSmall)),sim_pop,by="LocIDSmall")
+
+source("attrdl.R")
+
+# CREATE THE OBJECTS TO STORE THE RESULTS
+aftot_results<-antot_results<-artot_results<-data.frame()
+AN_city_list<-AF_city_list<-AR_city_list<-list()
+
+for(i in seq(length(outcome))){
+    # COEFFICIENTS AND VCOV FOR OVERALL CUMULATIVE SUMMARY
+    coef <- matrix(NA,length(regions_hosp),3,
+                   dimnames=list(cities$city))
+    vcov <- vector("list",length(regions_hosp))
+    names(vcov) <- regions_hosp
+    
+    # RUN THE LOOP
+    for(j in seq(length(dlist_hosp))) {
+        tryCatch({
+            # PRINT
+            cat(j,"")
+            # EXTRACT THE DATA
+            data <- dlist_hosp[[j]]
+            data$y <- data[[outcome[i]]]
+            # DEFINE THE CROSSBASIS
+            argvar <- list(fun="ns",knots=quantile(data$tmean,varper/100,na.rm=T))
+            cb <- crossbasis(data$tmean,lag=lag,argvar=argvar,
+                             arglag=list(knots=logknots(lag,lagnk)),group=data$year)
+            # RUN THE MODEL AND OBTAIN PREDICTIONS
+            # NB: NO CENTERING NEEDED HERE, AS THIS DOES NOT AFFECT COEF-VCOV
+            model <- glm(formula,data,family=quasipoisson,na.action="na.exclude")
+            cen <- mean(data$tmean,na.rm=T)
+            pred <- crosspred(cb,model,cen=cen,by=0.1)
+            cen <- pred$predvar[which.min(pred$allRRfit)] 
+            
+            # REDUCTION TO OVERALL CUMULATIVE
+            red <- crossreduce(cb,model,cen=cen)
+            coef[j,] <- coef(red)
+            vcov[[j]] <- vcov(red)
+        })
+    }
+    include <- (1:nrow(coef))[!is.na(coef[,1])]
+    
+    coef <- coef[include,]
+    vcov <- vcov[include]
+    
+    is_positive_definite <- function(mat) { 
+      #mat=vcov[[420]]
+      eigenvalues <- eigen(mat)$values 
+      max_vcov <- max(as.vector(mat))<1000
+      all(eigenvalues > 0) &(max_vcov)
+    }
+    index<-sapply(vcov,is_positive_definite)
+    
+    coef <- coef[which(index==TRUE),]
+    vcov <- vcov[which(index==TRUE)]
+    
+    ## Stage 2 MULTIVARIATE META-ANALYSIS OF THE REDUCED COEF AND THEN COMPUTATION OF BLUP
+    ################################################################################
+    # META-ANALYSIS-------------------------------
+    mv <- mixmeta(coef~1, vcov,control=list(showiter=T))
+    predper <- c(0:4,4.53,seq(4.6,5,0.1),6:97,97.5,98,seq(99,100,0.1))
+    set.seed(13041975)
+    tmeancity <- rowMeans(sapply(dlist_hosp[regions_hosp],function(x) quantile(jitter(x$tmean),
+                                                                               predper/100,na.rm=T)))
+    
+    tmeancity_thr<-tmeancity[tmeancity>=thr_tmp&tmeancity<=tmeancity["99.00%"]]
+    predper_thr <- predper[which(tmeancity >= thr_tmp&tmeancity<=tmeancity["99.00%"])]
+    # DEFINE INDICATOR FOR CENTERING PERCENTILE FROM AVERAGE ASSOCIATION
+    bvar <- onebasis(tmeancity_thr,fun="ns",
+                     knots=tmeancity[paste(varper,".00%",sep="")],
+                     Boundary.knots=c(min(tmeancity),max(tmeancity)))
+    cenindcity <- which.min(bvar%*%coef(mv))
+    
+    # DEFINE CENTERING PERCENTILE FOR EACH COUNTRY AND CITY
+    cenpercity <-pmin(pmax(predper_thr[cenindcity],1),99)
+    mintempcity <- tmeancity_thr[paste(format(cenpercity, nsmall = 2),"%",sep="")]
+    
+    # CREATE THE VECTORS TO STORE THE TOTAL MORTALITY (ACCOUNTING FOR MISSING)
+    totdeath <- totpop<- rep(NA,length(regions_SA2))
+    names(totdeath) <-names(totpop) <- regions_SA2
+    # CREATE THE MATRIX TO STORE THE ATTRIBUTABLE DEATHS
+    matsim_t<-matsim2014<-matsim2015<-matsim2016<-matsim2017<-matsim2018<-
+        matsim2019<- matrix(NA,length(regions_SA2),2,dimnames=list(regions_SA2, c("heat","extreme_heat")))
+    
+    # NUMBER OF SIMULATION RUNS FOR COMPUTING EMPIRICAL CI
+    nsim <- 1000
+    # CREATE THE ARRAY TO STORE THE CI OF ATTRIBUTABLE DEATHS
+    arraysim_t<-arraysim2014 <-arraysim2015 <-arraysim2016<-arraysim2017<-arraysim2018<-
+        arraysim2019<-array(NA,dim=c(length(regions_SA2),2,nsim),dimnames=list(regions_SA2, c("heat","extreme_heat")))
+    
+    set.seed(1234)
+    for(m in seq(dlist_SA2)){
+        cat(m,"")
+        pre_data <- dlist_SA2[[m]]
+        for(n in 2014:2019){
+            data<-pre_data[pre_data$year==n,]
+            # DERIVE THE CROSS-BASIS
+            argvar <- list(fun="ns",knots=tmeancity[paste(varper,".00%",sep="")],
+                           Boundary.knots=c(min(tmeancity),max(tmeancity)))
+            cb <- crossbasis(data$tmean,lag=lag,argvar=argvar,
+                             arglag=list(knots=logknots(lag,lagnk)),group=data$year)
+            
+            ## MMT
+            predvar <- quantile(data$tmean,c(1:97,97.5,98:99)/100,na.rm=T)
+            matsim<-get(paste0("matsim", n))
+            arraysim<-get(paste0("arraysim", n))
+            
+            # COMPUTE THE ATTRIBUTABLE Hosp
+            matsim[m,"heat"] <- attrdl(data$tmean,cb,data[[outcome[i]]],coef=coef(mv),
+                                       vcov=vcov(mv),type="af",dir="forw",cen=mintempcity,
+                                       range=c(mintempcity,100))
+            matsim[m,"extreme_heat"] <- attrdl(data$tmean,cb,data[[outcome[i]]],coef=coef(mv),
+                                               vcov=vcov(mv),type="af",dir="forw",cen=mintempcity,
+                                               range=c(predvar["97.5%"],100))
+            
+            
+            # COMPUTE EMPIRICAL OCCURRENCES OF THE ATTRIBUTABLE Hosp
+            arraysim[m,"heat",] <- attrdl(data$tmean,cb,data[[outcome[i]]],coef=coef(mv),
+                                          vcov=vcov(mv),type="af",dir="forw",cen=mintempcity,
+                                          range=c(mintempcity,100),sim=T,nsim=nsim)
+            arraysim[m,"extreme_heat",] <- attrdl(data$tmean,cb,data[[outcome[i]]],coef=coef(mv),
+                                                  vcov=vcov(mv),type="af",dir="forw",cen=mintempcity,
+                                                  range=c(predvar["97.5%"],100),sim=T,nsim=nsim)
+            totnum <- sum(data[[outcome[i]]],na.rm=T)
+            matsim[m,"heat"]<-matsim[m,"heat"]*totnum
+            matsim[m,"extreme_heat"]<-matsim[m,"extreme_heat"]*totnum
+            arraysim[m,"heat",]<-arraysim[m,"heat",]*totnum
+            arraysim[m,"extreme_heat",]<-arraysim[m,"extreme_heat",]*totnum
+            
+            assign(paste0("matsim", n), matsim)
+            assign(paste0("arraysim", n), arraysim)
+        }
+        # STORE THE DENOMINATOR OF ATTRIBUTABLE DEATHS, I.E. TOTAL OBSERVED MORTALITY
+        # CORRECT DENOMINATOR TO COMPUTE THE ATTRIBUTABLE FRACTION LATER, AS IN attrdl
+        totdeath[m] <- sum(pre_data[[outcome[i]]],na.rm=T)
+        totpop[m]<-pop_SA2$Tot_P_P[pop_SA2$LocIDSmall==regions_SA2[m]]
+    }
+    matsim_t<-matsim2014+matsim2015+matsim2016+matsim2017+matsim2018+matsim2019
+    arraysim_t<-arraysim2014+arraysim2015+arraysim2016+arraysim2017+arraysim2018+arraysim2019
+    
+    #ATTRIBUTABLE NUMBERS-----
+    # CITY-SPECIFIC
+    ancity <- matsim_t
+    ancitylow <- apply(arraysim_t,c(1,2),quantile,0.025, na.rm = TRUE)
+    ancityhigh <- apply(arraysim_t,c(1,2),quantile,0.975, na.rm = TRUE)
+    rownames(ancity) <- rownames(ancitylow) <- rownames(ancityhigh) <- regions_SA2
+    AN_city_list[[i]]<-ancity
+    names(AN_city_list)[i]<-outcome[i]
+
+
+    #######################################
+    # ATTRIBUTABLE FRACTION-------
+    # CITY-SPECIFIC
+    afcity <- ancity/totdeath*100
+    afcitylow <- ancitylow/totdeath*100
+    afcityhigh <- ancityhigh/totdeath*100
+    AF_city_list[[i]]<-afcity
+    names(AF_city_list)[i]<-outcome[i]
+    
+    #######################################
+    # ATTRIBUTABLE Rate-------
+    # CITY-SPECIFIC
+    arcity <- ancity/(totpop*6)*100000
+    arcitylow <- ancitylow/(totpop*6)*100000
+    arcityhigh <- ancityhigh/(totpop*6)*100000
+    AR_city_list[[i]]<-arcity
+    names(AR_city_list)[i]<-outcome[i]
+}
+
