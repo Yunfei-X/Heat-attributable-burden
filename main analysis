@@ -5,7 +5,7 @@ varper <- c(50,90)
 varfun = "ns"
 
 # PARAMETERS FOR THE LAG-RESPONSE FUNCTION
-lag <- 10
+lag <- 21
 lagnk <- 2
 
 # DEGREES OF FREEDOM FOR SEASONALITY
